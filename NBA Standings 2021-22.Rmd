@@ -1,0 +1,345 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = FALSE, echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+
+```{r}
+library(tidyverse)
+library(nbastatR)
+library(teamcolors)
+library(reactable)
+library(reactablefmtr)
+library(htmltools)
+library(crosstalk)
+library(rvest)
+library(janitor)
+```
+
+
+```{r}
+##### Define Themes #####
+# match 538's table theme for the reactable table
+theme_538 <- function() {
+    reactable::reactableTheme(
+        searchInputStyle = list(width = "31%", backgroundColor = "#F9F9F9"),
+        style = list(
+            fontFamily = "Chivo"
+        ),
+        headerStyle = list(
+            "&:hover[aria-sort]" = list(
+                background = "hsl(0, 0%, 80%)"),
+            "&[aria-sort='ascending'], &[aria-sort='descending']" = list(
+                background = "#555",
+                color = "#FFF"
+            ),
+            borderColor = "#333"
+        ),
+        borderColor = "#CDCDCD"
+    )
+}
+
+# Define color palette to use in tables
+my_color_pal <- c("#ffffff", "#f2fbd2", "#c9ecb4", "#93d3ab", "#35b0ab")
+
+temppal <- c("#36a1d6", "#76b8de", "#a0bfd9", "#ffffff", "#d88359", "#d65440", "#c62c34")
+```
+
+
+```{r}
+##### Load Data #####
+
+# Load NBA game logs from nbastatR
+df_team_logs <- game_logs(seasons = 2022, result_types = "team", season_types = "Regular Season")
+
+# Load team stats data from BREF.com. This loads multiple data frames into your environment at once
+bref_teams_stats(seasons = 2022)
+
+# Read in games data from nbastatR
+nba_standings <- nbastatR::standings(seasons = 2022) %>%
+    select(slugSeason:TeamSlug, recordOverall) %>% 
+    mutate(slugTeam = case_when(
+        teamName == "Clippers" ~ "LAC", 
+        teamName == "Nuggets" ~ "DEN", 
+        TRUE ~ slugTeam
+    ))
+
+```
+
+```{r}
+
+# Get each team's Net Rating and other advances stats from basketball-reference
+url <- "https://www.basketball-reference.com/leagues/NBA_2022.html"
+
+bref_tables <- url %>% 
+  read_html() %>% 
+  html_table()
+
+df_tm_net_rating <- bref_tables[[11]]
+
+df_tm_net_rating <- df_tm_net_rating %>% 
+  row_to_names(row_number = 1) %>% 
+  clean_names()
+
+df_tm_net_rating <- head(df_tm_net_rating, - 1) #delete league average row at the bottom
+
+df_tm_net_rating <- df_tm_net_rating %>% 
+    mutate(team = case_when(
+        team == "Los Angeles Clippers" ~ "LA Clippers",
+        TRUE ~ team
+    ))
+
+df_tm_net_rating <- df_tm_net_rating %>% 
+    select(team, pw, pl, mov, o_rtg, d_rtg, n_rtg, attend_g) 
+
+```
+
+
+```{r}
+# get team logos from the nbastatR package
+logos <- nba_teams() %>% 
+    filter(isNonNBATeam == 0) %>% 
+    select(nameTeam, slugTeam, urlThumbnailTeam) %>% 
+    mutate(nameTeam = case_when(
+        nameTeam == "Portland Trail Blazers" ~ "Portland Trailblazers",
+        nameTeam == "Los Angeles Clippers" ~ "LA Clippers",
+        TRUE ~ nameTeam
+    ))
+
+# get nba team colors 
+tc <- teamcolors %>% 
+    filter(league == "nba") %>% select(name, primary:quaternary)
+
+
+# Get url for scraping data from vegasinsider and scrape tables on the page using rvest
+vegasURL <- "https://www.vegasinsider.com/nba/odds/futures/"
+```
+
+
+```{r}
+#clean data
+
+vi_raw <- vegasURL %>% 
+    read_html() %>% 
+    html_nodes("table") %>% 
+    html_table(fill = TRUE)
+
+vegas_odds <- vi_raw %>% 
+    .[8] %>% #extract the element from the list containing the finals odds table that is returned from the html table
+    as.data.frame()
+
+names(vegas_odds) <- vegas_odds[1,] #clean up column names
+
+vegas_odds <- vegas_odds %>% 
+    slice(-1)
+
+vegas_odds$Odds <- str_remove(vegas_odds$Odds, "[+]")
+vegas_odds$Odds <- str_remove(vegas_odds$Odds, "[-]")
+
+vegas_odds <- vegas_odds %>% 
+    as_tibble() %>% 
+    type_convert() %>% 
+    mutate(implied_odds = 1-Odds/(Odds+100)) %>% 
+    mutate(Team = case_when(
+        Team == "Los Angeles Clippers" ~ "LA Clippers", 
+        TRUE ~ Team
+    ))
+```
+
+
+```{r}
+# join datasets together
+df_nba <- left_join(vegas_odds, nba_standings, by = c("Team" = "nameTeam"))
+
+df_nba <- df_nba %>% 
+    mutate(pct_diff = pctWinTeam - implied_odds) #calcualte performance relative to Vegas expectations
+
+df_nba <- left_join(df_nba, logos, by = c("Team" = "nameTeam")) #joining logos
+
+df_nba <- df_nba %>% 
+    mutate(rank = row_number()) %>% 
+    relocate(rank)
+
+# join advanced stats scraped data from BREF
+df_nba <- left_join(df_nba, df_tm_net_rating, by = c("Team" = "team"))
+
+```
+
+
+```{r}
+#make reactable table
+
+tbl_react <- df_nba %>% 
+    select(rank, urlThumbnailTeam, Team, nameConference, recordOverall, slugStreakCurrent, pw, pl, mov, o_rtg, d_rtg, n_rtg, attend_g, pctWinTeam, pct_diff, implied_odds) %>% 
+    reactable(
+          theme = theme_538,
+          columnGroups = list(
+              colGroup(name = "According to Vegas", 
+                       columns = c("pct_diff", "implied_odds")),
+              colGroup(name = "Pythagorean Wins and Losses", 
+                       columns = c("pw", "pl"))
+          ),
+          showSortIcon = TRUE,
+          searchable = TRUE,
+          defaultSorted = c("implied_odds","pctWinTeam"),
+          defaultSortOrder = "desc",
+          language = reactableLang(
+              searchPlaceholder = "SEARCH FOR A TEAM..."),
+          defaultPageSize = 100,
+          columns = list(
+              rank = colDef(name = "Rank",
+                            align = "left",
+                            maxWidth = 60),
+              Team = colDef(minWidth = 200,
+                                 name = "Team",
+                                 align = "left"),
+              nameConference = colDef(align = "left",
+                                name = "Conf.",
+                                minWidth = 80),
+              pctWinTeam = colDef(align = "right",
+                                  name = "Win %",
+                                  style = list(borderRight = "2px solid #555")),
+              slugStreakCurrent = colDef(align = "right",
+                                         style = list(borderRight = "2px solid #555"),
+                                         name = "Streak"),
+              pw = colDef(align = "right",
+                          name = "PW"),
+              pl = colDef(align = "right",
+                          name = "PL"),
+              mov = colDef(align = "right",
+                          name = "MOV"),
+              o_rtg = colDef(align = "right",
+                             cell = color_tiles(nba_df,
+                                                temppal,
+                                                number_fmt=scales::number_format()), 
+                             format =  colFormat(digits = 1),
+                          name = "Offensive Rating"),
+              d_rtg = colDef(align = "right",
+                          name = "Defense Rating"),
+              n_rtg = colDef(align = "right",
+                          name = "Net Rating"),
+              attend_g = colDef(align = "right",
+                                minWidth = 110,
+                          name = "Attendance per Game"),
+              recordOverall = colDef(align = "center",
+                                     name = "Record"),
+              pct_diff = colDef(align = "right",
+                                name = "vs Expectation",
+                                minWidth = 110,
+                                format =  colFormat(digits = 3)),
+              implied_odds = colDef(align = "right",
+                                    name = "Winning NBA Title",
+                                    style = color_scales(df_nba, colors = paletteer::paletteer_d(
+                                        palette = "ggsci::amber_material")),
+                                    format =  colFormat(percent = TRUE, digits = 0)),
+              
+              ### add logos using embed_img()
+              urlThumbnailTeam = colDef(
+                  name = "",
+                  maxWidth = 70,
+                  align = "center",
+                  cell = embed_img(height = "30", width = "30")
+              )),
+          pagination = FALSE,
+          compact = TRUE, 
+          borderless = FALSE, 
+          striped = FALSE,
+          fullWidth = FALSE, 
+          defaultColDef = colDef(align = "center", minWidth = 100)
+)
+```
+
+
+```{css, include = TRUE}
+
+.table-wrap {
+  box-shadow: 2px 3px 20px black;
+  background-color: #fafafa;
+  font-size: 17px;
+  font-weight: 400;
+  font-family: Chivo;
+  padding: 20px 20px 20px 20px;  
+}
+.table-title {
+  font-size: 42px;
+  font-weight: 500;
+  line-height: 1.7
+}
+.table-sub {
+  font-size: 16px;
+  color: #6e6b6b;
+  font-weight: 400;
+}
+.table-dropdown {
+  font-size: 16px;
+  color: #6e6b6b;
+}
+.table-cap {
+  font-size: 14px;
+  font-weight: 200;
+}
+```
+
+
+```{r}
+# Create titles, subtitles, and captions
+title <- "2021-22 NBA Standings"
+subtitle_1 <- "The table shows actual wins versus expected wins and also shows a ten game rolling average of margin of victory/defeat. Expected wins is derived from points scored and points allowed. The rolling average is derived from the average +/- points differential from the preceding ten games. The dotted line shows the average across all ten game intervals for the season."
+caption <- "Stephan Teodosescu @steodosescu | Source: Basketball-Reference via {nbastatR}"
+```
+
+
+```{r}
+# load font from google fonts
+htmltools::tags$link(href = "https://fonts.googleapis.com/css?family=Chivo:400,600,700&display=swap", rel = "stylesheet")
+```
+
+
+```{r, include = TRUE}
+ima <- here::here("nba-logo.png")
+
+div(class = "table-wrap",
+    br(),
+    tags$img(src = ima,
+             align = "right",
+             width = "40px",
+             height = "80px"),
+    div(class = "table-title", title),
+    div(class = "table-sub", subtitle_1),
+    br(),
+    br(),
+    tbl_react,
+    div(class = "table-cap", 
+        tags$span(style = "font-weight:500; line-height:2", "GLOSSARY"),
+        br(),
+        tags$span(style = "font-weight:400", "PW:"), 
+        "Pythagorean Wins, or expected wins purely based on points scored and allowed.",
+        br(),
+        tags$span(style = "font-weight:400", "PL:"), 
+        "Pythagorean Losses, or expected losses purely based on points scored and allowed.",
+        br(),
+        tags$span(style = "font-weight:400", "MOV:"), 
+        "Average margin of victory.",
+        br(),
+        tags$span(style = "font-weight:400", "Offensive Rating:"), 
+        "an estimate of points scored per 100 possessions.",
+        br(),
+        tags$span(style = "font-weight:400", "Defensive Rating:"), 
+        "an estimate of points allowed per 100 possessions.",
+        br(),
+        tags$span(style = "font-weight:400", "Net Rating:"), 
+        "an estimate of point differential per 100 possessions.",
+        br(),
+        tags$span(style = "font-weight:400", "Pace:"), 
+        "an estimate of possessions per 48 minutes.",
+        br(),
+        tags$span(style = "font-weight:400", "Vegas:"), 
+        "Betting odds based on BetMGM lines via vegasinsider.com"
+        ),
+        br(),
+    div(class = "table-cap",
+        tags$span(style = "font-weight:400", "TABLE:"), 
+        caption)
+)
+
+```
